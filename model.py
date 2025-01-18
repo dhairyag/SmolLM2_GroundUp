@@ -16,13 +16,19 @@ class SmolLM2Config:
     num_attention_heads: int = 9
     num_key_value_heads: int = 3
     hidden_act: str = "silu"
-    max_position_embeddings: int = 2048
+    max_position_embeddings: int = 8192
     initializer_range: float = 0.041666666666666664
     rms_norm_eps: float = 1e-5
     vocab_size: int = 49152
-    rope_theta: float = 10000.0
+    rope_theta: float = 100000.0
     use_cache: bool = True
     tie_word_embeddings: bool = True
+    head_dim: int = 64
+    attention_dropout: float = 0.0
+    attention_bias: bool = False
+    mlp_bias: bool = False
+    model_type: str = "llama"
+    torch_dtype: str = "float32"
 
 
 class RMSNorm(nn.Module):
@@ -46,8 +52,13 @@ def precompute_rope_freqs(dim: int, max_position_embeddings: int, theta: float =
 
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:x.shape[1], :]
-    x_rotated = x_complex * freqs_cis.unsqueeze(0)
+    
+    # Ensure freqs_cis has the shape (1, seq_length, 1, head_dim//2) for correct broadcasting
+    freqs_cis = freqs_cis[:x.shape[1], :].unsqueeze(0).unsqueeze(2)
+    
+    # Apply RoPE
+    x_rotated = x_complex * freqs_cis  # Now shapes are compatible for broadcasting
+    
     x_out = torch.view_as_real(x_rotated).flatten(-2)
     return x_out.type_as(x)
 
@@ -57,14 +68,16 @@ class SmolLM2Attention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        
+        self.attention_dropout = config.attention_dropout
 
     def forward(
         self,
@@ -83,19 +96,30 @@ class SmolLM2Attention(nn.Module):
         key_states = key_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim)
 
-        query_states = apply_rope(query_states, freqs_cis)
-        key_states = apply_rope(key_states, freqs_cis)
+        if freqs_cis is not None:
+            query_states = apply_rope(query_states, freqs_cis)
+            key_states = apply_rope(key_states, freqs_cis)
 
         key_states = torch.repeat_interleave(key_states, self.num_key_value_groups, dim=2)
         value_states = torch.repeat_interleave(value_states, self.num_key_value_groups, dim=2)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        if hasattr(F, "scaled_dot_product_attention"):
+            attn_output = F.scaled_dot_product_attention(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+            )
+            attn_output = attn_output.transpose(1, 2)
+        else:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            if self.attention_dropout > 0.0 and self.training:
+                attn_weights = F.dropout(attn_weights, p=self.attention_dropout)
+            attn_output = torch.matmul(attn_weights, value_states)
         
         attn_output = attn_output.reshape(batch_size, seq_length, self.hidden_size)
         attn_output = self.o_proj(attn_output)
@@ -106,9 +130,9 @@ class SmolLM2Attention(nn.Module):
 class SmolLM2MLP(nn.Module):
     def __init__(self, config: SmolLM2Config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
@@ -147,18 +171,22 @@ class SmolLM2Model(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         
+        self.dtype = getattr(torch, config.torch_dtype) if hasattr(torch, config.torch_dtype) else torch.float32
+        
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([SmolLM2Block(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
         self.freqs_cis = precompute_rope_freqs(
-            self.config.hidden_size // self.config.num_attention_heads,
-            self.config.max_position_embeddings,
-            self.config.rope_theta,
+            config.head_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
         )
         
         self.apply(self._init_weights)
+        
+        self.to(self.dtype)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -178,7 +206,7 @@ class SmolLM2Model(nn.Module):
             attention_mask = attention_mask.to(dtype=hidden_states.dtype)
             attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
 
-        freqs_cis = self.freqs_cis.to(hidden_states.device)
+        freqs_cis = self.freqs_cis.to(device=hidden_states.device, dtype=hidden_states.dtype)
         
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, freqs_cis)

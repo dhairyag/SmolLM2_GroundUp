@@ -10,6 +10,7 @@ import random
 from huggingface_hub import login
 import torch.nn.functional as F
 import time
+import json
 
 def setup_training():
     # Login to Hugging Face using environment variable
@@ -45,7 +46,7 @@ def setup_training():
     
     return model, tokenizer, device
 
-def load_and_prepare_data(tokenizer, batch_size=4):
+def load_and_prepare_data(tokenizer, batch_size=32):
     dataset = load_dataset(
         "HuggingFaceTB/smollm-corpus", 
         "cosmopedia-v2", 
@@ -65,10 +66,10 @@ def load_and_prepare_data(tokenizer, batch_size=4):
                 text_hash = hash(text[:100])
                 if text_hash not in seen_texts:
                     seen_texts[text_hash] = text[:50]
-                    if len(seen_texts) % 100 == 0:
-                        print(f"\nNew unique texts: {len(seen_texts)}")
+                    #if len(seen_texts) % 100 == 0:
+                        #print(f"\nNew unique texts: {len(seen_texts)}")
                         # Print the most recent text
-                        print(f"Recent sample: {text[:100]}...")
+                        #print(f"Recent sample: {text[:100]}...")
         
         # Tokenize all texts in batch
         outputs = tokenizer(
@@ -165,6 +166,31 @@ def generate_sample_text(model, tokenizer, device, prompt="Once upon a time", ma
     model.train()
     return f"{prompt} {generated_text}"
 
+def save_metrics(metrics_dict, filename="training_metrics.pt"):
+    """Save training metrics to a file"""
+    torch.save(metrics_dict, filename)
+    print(f"Metrics saved to {filename}")
+
+def save_model_for_hf(model, tokenizer, output_dir):
+    """Save model and tokenizer in a HuggingFace compatible format"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save model state dict
+    model_path = os.path.join(output_dir, "pytorch_model.bin")
+    torch.save(model.state_dict(), model_path)
+    
+    # Save config
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path, 'w') as f:
+        json.dump(model.config.__dict__, f)
+    
+    # Save tokenizer
+    tokenizer_path = os.path.join(output_dir, "tokenizer")
+    os.makedirs(tokenizer_path, exist_ok=True)
+    tokenizer.save_pretrained(tokenizer_path)
+    
+    print(f"Model and tokenizer saved to {output_dir}")
+
 def main():
     try:
         # Setup
@@ -195,6 +221,16 @@ def main():
         
         print("Starting training...")
         
+        # Initialize metrics dictionary
+        metrics = {
+            'steps': [],
+            'loss': [],
+            'learning_rate': [],
+            'unique_texts': [],
+            'timestamp': [],
+            'unique_content_count': []
+        }
+        
         while step < num_steps:
             try:
                 batch = next(train_iterator)
@@ -206,34 +242,34 @@ def main():
                 # Calculate loss first
                 outputs, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
                 
+                # Record metrics
+                metrics['steps'].append(step)
+                metrics['loss'].append(loss.item())
+                metrics['learning_rate'].append(optimizer.param_groups[0]['lr'])
+                metrics['timestamp'].append(time.time())
+                metrics['unique_content_count'].append(len(unique_content))
+                
                 # Now we can use loss in our prints and checks
-                if step % 210 == 0:
+                if step % 100 == 0:
                     print(f"\nStep {step}")
                     print(f"Loss: {loss.item():.4f}")
                     print(f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+                    print(f"Unique content: {len(unique_content)}")
                     
-                    # Generate with more controlled settings
-                    if step > 0:  # Skip first step
-                        sample_text = generate_sample_text(
-                            model, 
-                            tokenizer, 
-                            device,
-                            prompt="The quick brown fox",
-                            max_length=50,
-                            temperature=0.8
-                        )
-                        print(f"Sample generation:\n{sample_text}")
+                    # Save metrics periodically
+                    save_metrics(metrics, f"checkpoints/metrics_{step}.pt")
+                    
                 
                 # Track unique content
                 for seq in batch["input_ids"]:
                     content = tokenizer.decode(seq[:50])
                     unique_content.add(content)
                 
-                if time.time() - last_batch_check > 300:
-                    print(f"\nUnique content pieces seen: {len(unique_content)}")
-                    sample = list(unique_content)[-1]
-                    print(f"Latest unique content: {sample[:100]}...")
-                    last_batch_check = time.time()
+                # if time.time() - last_batch_check > 300:
+                #     print(f"\nUnique content pieces seen: {len(unique_content)}")
+                #     sample = list(unique_content)[-1]
+                #     #print(f"Latest unique content: {sample[:100]}...")
+                #     last_batch_check = time.time()
                 
                 # Gradient steps
                 loss.backward()
@@ -256,9 +292,11 @@ def main():
                             max_length=50,
                             temperature=0.8
                         )
-                        print(f"\nGenerated ({step} steps):\n{sample_text}")
+                        print(f"\nGenerated ({step} steps):\n<< {sample_text} >>")
                     
                     save_checkpoint(model, optimizer, step, f"checkpoints/checkpoint_{step}.pt")
+                    # Save model in HuggingFace format
+                    save_model_for_hf(model, tokenizer, f"smollm2_model_step_{step}")
                 
                 step += 1
                 progress_bar.update(1)
@@ -269,17 +307,31 @@ def main():
                 continue
             
             except Exception as e:
+                # Save metrics even if training fails
+                save_metrics(metrics, "checkpoints/metrics_interrupted.pt")
                 print(f"Error in training loop: {str(e)}")
                 raise e
         
+        # Save final metrics
+        save_metrics(metrics, "checkpoints/metrics_final.pt")
+        
         # Save final checkpoint
         save_checkpoint(model, optimizer, step, "checkpoints/checkpoint_final.pt")
+        save_model_for_hf(model, tokenizer, "smollm2_model_final")
         
         print("\nStarting additional training...")
         # Additional 50 steps after loading checkpoint
         print("\nLoading final checkpoint and training for 50 more steps...")
         load_checkpoint(model, optimizer, "checkpoints/checkpoint_final.pt")
+
+        # Additional training metrics
+        additional_metrics = {
+            'steps': [],
+            'loss': [],
+            'timestamp': []
+        }
         
+        # Additional 50 steps after loading checkpoint
         for extra_step in range(50):
             try:
                 batch = next(train_iterator)
@@ -297,6 +349,14 @@ def main():
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            
+            # Record additional metrics
+            additional_metrics['steps'].append(num_steps + extra_step)
+            additional_metrics['loss'].append(loss.item())
+            additional_metrics['timestamp'].append(time.time())
+        
+        # Save additional metrics
+        save_metrics(additional_metrics, "checkpoints/metrics_additional.pt")
         
         # Save final model after additional training
         save_checkpoint(model, optimizer, num_steps + 50, "checkpoints/checkpoint_final_extended.pt")

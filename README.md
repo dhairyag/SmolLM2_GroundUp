@@ -4,22 +4,22 @@ This repository contains a PyTorch implementation of the SmolLM2 language model,
 
 ### Training Details [Log file](log_training.md)
 
-The model was initially trained for 5000 steps with a batch size of 32. After reaching this milestone, an additional 50 steps of training were performed to ensure model stability and convergence.
+The model was initially trained for 5000 steps with a batch size of 32. After reaching this milestone, an additional 50 steps of training were performed to verify save/load functionality and further ensure model stability and convergence.
 
 **Two-Phase Training Approach**
 
 1. **Main Training Phase (5000 steps)**
-   - Trained with standard learning rate and optimization parameters
-   - Model and metrics saved at regular checkpoints (every 500 steps)
-   - Final model saved as `smollm2_model_final`
+    - Trained with standard learning rate and optimization parameters
+    - Model and metrics saved at regular checkpoints (every 500 steps)
+    - Final model saved as `smollm2_model_final`
 
 2. **Additional Training Phase (50 steps)**
-   - Loaded the final checkpoint from main phase
-   - Performed fine-tuning with 50 additional steps
-   - Loss values remained stable (ranging between 0.0004-0.0022)
-   - Helped verify model stability and convergence
+    - Loaded the final checkpoint from the main phase
+    - Performed fine-tuning with 50 additional steps
+    - Loss values remained stable (ranging between 0.0004-0.0022)
+    - Assisted in verifying both model stability and the integrity of the save/load process
 
-This two-phase approach helped validate that the model reached a stable training state, with consistently low loss values during the additional training steps. The stable loss metrics in the second phase (averaging around 0.0007) indicate successful model convergence.
+This two-phase approach helped validate that the model reached a stable training state, with consistently low loss values during the additional training steps. The stable loss metrics in the second phase (averaging around 0.0007) indicate successful model convergence and confirm the reliability of the checkpointing mechanism.
 
 ### [Hugging Face Demo Link](https://huggingface.co/spaces/dhairyashil/SmolLM2_GroundUp)
 The model here was trained for 5000 steps on a 135M parameter model with a batch size of 32.

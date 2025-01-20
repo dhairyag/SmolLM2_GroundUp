@@ -2,7 +2,7 @@
 
 This repository contains a PyTorch implementation of the SmolLM2 language model, a compact transformer-based model with grouped-query attention, designed for efficient natural language processing. Built from the ground up through reverse engineering, this implementation closely follows the architecture described in the model's Hugging Face specifications, primarily based on the model's Hugging Face model card (hf_model.md) and configuration files (config_smollm2_135M.yaml). It provides a clear, documented codebase for learning and experimentation.
 
-### Training Details
+### Training Details [Log file](log_training.md)
 
 The model was initially trained for 5000 steps with a batch size of 32. After reaching this milestone, an additional 50 steps of training were performed to ensure model stability and convergence.
 
